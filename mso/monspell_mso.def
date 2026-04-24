@@ -1,0 +1,18 @@
+LIBRARY monspell_mso
+EXPORTS
+    SpellerVersion
+    SpellerInit
+    SpellerTerminate
+    SpellerSetOptions
+    SpellerGetOptions
+    SpellerOpenLex
+    SpellerCloseLex
+    SpellerCheck
+    SpellerAddUdr
+    SpellerAddChangeUdr
+    SpellerDelUdr
+    SpellerClearUdr
+    SpellerGetSizeUdr
+    SpellerGetListUdr
+    SpellerBuiltinUdr
+    DllCanUnloadNow

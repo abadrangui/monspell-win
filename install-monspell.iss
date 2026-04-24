@@ -4,14 +4,19 @@
 ; file so upstream rebases do not conflict. See docs/fork-divergence.md.
 ;
 ; Phase 0 scope:
-;  - Both 32-bit and 64-bit windivvun.dll. WSCAPI provider DLLs must match
-;    the bitness of the app loading them (64-bit Word needs 64-bit DLL;
-;    32-bit Office or UWP apps need 32-bit). Registered in both HKLM32 +
-;    HKLM64 registry views so Windows finds the right one per caller.
-;  - Ships a stub mn.bhfst. No divvunspellmso.dll (Office 2010-2019 Custom
-;    Proofing registration is deferred past Phase 0 — Office 365 uses
-;    WSCAPI directly).
-;  - Ships no spelli.exe — this script does all the registry writes inline.
+;  - windivvun.dll (WSCAPI provider) — both 32-bit and 64-bit. WSCAPI provider
+;    DLLs must match the bitness of the app loading them (64-bit Word needs
+;    64-bit DLL; 32-bit Office or UWP apps need 32-bit). Registered in both
+;    HKLM32 + HKLM64 registry views so Windows finds the right one per caller.
+;  - monspell_mso.dll (CSAPI "say-yes" stub) — both bitnesses. Required
+;    because Word 2016+ will not dispatch WSCAPI for a language unless a
+;    CSAPI proofing tool is also registered for it. Microsoft never shipped
+;    a CSAPI proofing tool for Mongolian, so we ship our own minimum-viable
+;    stub. Registered at both the legacy Override\<lang>\LEX/DLL path and
+;    the Spelling\<LCID>\Normal\Engine/Dictionary path.
+;  - Stub mn.bhfst (WSCAPI dictionary) and empty mn.lex (CSAPI dictionary
+;    placeholder). The real Mongolian FST arrives in Phase 1 from lang-khk.
+;  - No spelli.exe — this script does all the registry writes inline.
 ;  - Unsigned per ADR-0003.
 
 #define MyAppName "monspell"
@@ -49,13 +54,19 @@ ArchitecturesAllowed=x86 x64compatible
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
-; 32-bit windivvun DLL — loaded by 32-bit apps (legacy Office, some UWP hosts).
+; 32-bit windivvun DLL (WSCAPI) — loaded by 32-bit apps (legacy Office, some UWP hosts).
 Source: "target\release\windivvun.dll"; DestDir: "{app}\i686\"; Flags: ignoreversion restartreplace uninsrestartdelete
-; 64-bit windivvun DLL — loaded by 64-bit Word / Outlook / most Office 365 installs.
+; 64-bit windivvun DLL (WSCAPI) — loaded by 64-bit Word / Outlook / most Office 365 installs.
 Source: "target\x86_64-pc-windows-msvc\release\windivvun.dll"; DestDir: "{app}\x86_64\"; Flags: ignoreversion restartreplace uninsrestartdelete; Check: IsWin64
-; Stub Mongolian speller — flags every word, suggests the input back.
-; Will be replaced by a real Mongolian FST in Phase 1.
+; 32-bit monspell_mso DLL (CSAPI "say-yes" stub) — unlocks Word's language gate for 32-bit Office.
+Source: "mso\target\release\monspell_mso.dll"; DestDir: "{app}\i686\"; Flags: ignoreversion restartreplace uninsrestartdelete
+; 64-bit monspell_mso DLL (CSAPI "say-yes" stub) — unlocks Word's language gate for 64-bit Office 365.
+Source: "mso\target\x86_64-pc-windows-msvc\release\monspell_mso.dll"; DestDir: "{app}\x86_64\"; Flags: ignoreversion restartreplace uninsrestartdelete; Check: IsWin64
+; WSCAPI speller data — stub, flags every word.
 Source: "Spellers\mn.bhfst"; DestDir: "{app}\Spellers\"; Flags: ignoreversion
+; CSAPI lexicon placeholder — empty; our CSAPI stub never reads it, but Word
+; wants the registered LEX path to exist on disk before it will load the DLL.
+Source: "Spellers\mn.lex"; DestDir: "{app}\Spellers\"; Flags: ignoreversion
 
 [Dirs]
 Name: "{app}\Spellers"
@@ -88,4 +99,45 @@ Root: HKLM32; Subkey: "SOFTWARE\Classes\CLSID\{#Clsid}\InProcServer32"; ValueTyp
 ; derived from the DLL's own install path: <install_root>\Spellers\.
 ; The [Dirs] section above already created that folder; [Files] above
 ; puts mn.bhfst in it. So no extra per-language registry entries are
-; required for Phase 0.
+; required for WSCAPI discovery.
+
+; ====================================================================
+; Office CSAPI (Custom Proofing Tool) registration.
+;
+; Required for Word 2016+ to dispatch WSCAPI for Mongolian. Without these
+; keys Word's "Set Proofing Language" dialog greys out / shows a "MISSING
+; PROOFING TOOLS" banner and refuses to call WSCAPI even when WSCAPI has a
+; registered provider. See github.com/abadrangui/monspell-win
+; docs/fork-divergence.md for the research that established this.
+;
+; Two paths are required, BOTH written:
+;
+;  - Override\mn-MN        — Word consults this for the language->DLL map.
+;                            Writing here is what unlocks the language in
+;                            the proofing-language picker. DLL64/LEX64 for
+;                            x64 Word; DLL/LEX for x86 Office.
+;  - Spelling\1104\Normal  — the engine-by-LCID path. 1104 = 0x0450 = mn-MN.
+;                            Contains the actual Engine + Dictionary values
+;                            the speller loader reads at runtime.
+;
+; Duplicated across HKLM64 and HKLM32 (Wow6432Node) because 32-bit Office
+; and 64-bit Office look in different registry views.
+; ====================================================================
+
+; --- 64-bit Office proofing registration ---
+Root: HKLM64; Subkey: "SOFTWARE\Microsoft\Shared Tools\Proofing Tools\1.0\Override\mn-MN"; ValueType: string; ValueName: "DLL64"; ValueData: "{app}\x86_64\monspell_mso.dll"; Flags: uninsdeletekey; Check: IsWin64
+Root: HKLM64; Subkey: "SOFTWARE\Microsoft\Shared Tools\Proofing Tools\1.0\Override\mn-MN"; ValueType: string; ValueName: "LEX64";  ValueData: "{app}\Spellers\mn.lex";            Flags: uninsdeletekey; Check: IsWin64
+Root: HKLM64; Subkey: "SOFTWARE\Microsoft\Shared Tools\Proofing Tools\1.0\Override\mn-MN"; ValueType: string; ValueName: "DLL";   ValueData: "{app}\i686\monspell_mso.dll";   Flags: uninsdeletekey; Check: IsWin64
+Root: HKLM64; Subkey: "SOFTWARE\Microsoft\Shared Tools\Proofing Tools\1.0\Override\mn-MN"; ValueType: string; ValueName: "LEX";   ValueData: "{app}\Spellers\mn.lex";            Flags: uninsdeletekey; Check: IsWin64
+
+Root: HKLM64; Subkey: "SOFTWARE\Microsoft\Shared Tools\Proofing Tools\Spelling\1104\Normal"; ValueType: string; ValueName: "Engine";     ValueData: "{app}\x86_64\monspell_mso.dll"; Flags: uninsdeletekey; Check: IsWin64
+Root: HKLM64; Subkey: "SOFTWARE\Microsoft\Shared Tools\Proofing Tools\Spelling\1104\Normal"; ValueType: string; ValueName: "Dictionary"; ValueData: "{app}\Spellers\mn.lex";            Flags: uninsdeletekey; Check: IsWin64
+
+; --- 32-bit Office proofing registration (Wow6432Node) ---
+Root: HKLM32; Subkey: "SOFTWARE\Microsoft\Shared Tools\Proofing Tools\1.0\Override\mn-MN"; ValueType: string; ValueName: "DLL64"; ValueData: "{app}\x86_64\monspell_mso.dll"; Flags: uninsdeletekey; Check: IsWin64
+Root: HKLM32; Subkey: "SOFTWARE\Microsoft\Shared Tools\Proofing Tools\1.0\Override\mn-MN"; ValueType: string; ValueName: "LEX64";  ValueData: "{app}\Spellers\mn.lex";            Flags: uninsdeletekey; Check: IsWin64
+Root: HKLM32; Subkey: "SOFTWARE\Microsoft\Shared Tools\Proofing Tools\1.0\Override\mn-MN"; ValueType: string; ValueName: "DLL";   ValueData: "{app}\i686\monspell_mso.dll";   Flags: uninsdeletekey
+Root: HKLM32; Subkey: "SOFTWARE\Microsoft\Shared Tools\Proofing Tools\1.0\Override\mn-MN"; ValueType: string; ValueName: "LEX";   ValueData: "{app}\Spellers\mn.lex";            Flags: uninsdeletekey
+
+Root: HKLM32; Subkey: "SOFTWARE\Microsoft\Shared Tools\Proofing Tools\Spelling\1104\Normal"; ValueType: string; ValueName: "Engine";     ValueData: "{app}\i686\monspell_mso.dll"; Flags: uninsdeletekey
+Root: HKLM32; Subkey: "SOFTWARE\Microsoft\Shared Tools\Proofing Tools\Spelling\1104\Normal"; ValueType: string; ValueName: "Dictionary"; ValueData: "{app}\Spellers\mn.lex";           Flags: uninsdeletekey
