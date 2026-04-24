@@ -1625,7 +1625,7 @@ dependencies = [
 
 [[package]]
 name = "windivvun"
-version = "1.4.7"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "chrono",
