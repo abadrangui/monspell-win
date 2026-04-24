@@ -25,14 +25,13 @@ This is the part that separates a close fork from a hard fork. Lapsing here is t
 - **Divergence log.** Every deliberate divergence gets an entry in `docs/fork-divergence.md` at the time of divergence, including the reason it cannot be upstreamed. Retroactive entries are not acceptable — they defeat the purpose.
 - **Skipped rebase = re-open ADR-0002.** If we skip a scheduled rebase, or if the divergence log is growing without corresponding upstream PRs, the discipline is breaking. The honest response is to re-open ADR-0002 in the main `monspell` repo and either recommit to discipline or adopt a hard-fork posture explicitly.
 
-## Branch conventions
+## Branches
 
-- `master` — fork-primary branch. Matches upstream where possible; diverges only where `docs/fork-divergence.md` records it.
+- `master` — fork-primary branch. Solo-owner workflow: commits land directly here. Matches upstream where possible; diverges only where `docs/fork-divergence.md` records it.
 - `upstream/master` — upstream's `master`, used as the rebase target. Do not push to this remote.
-- `feature/<topic>` — topic branches for upstream-candidate changes (PR target: `divvun/windivvun-service`).
-- `monspell/<topic>` — topic branches for fork-local divergences (PR target: `abadrangui/monspell-win` `master`).
+- **Upstream PRs** — when a commit is a commons contribution to `divvun/windivvun-service`, cherry-pick it onto a throwaway branch at PR-submission time, push, open the PR, and delete the branch after merge. Do not maintain long-lived upstream-PR-candidate branches.
 
-The `divvun/windivvun-service` upstream uses `master`, `develop`, `release`, and `feature/*` branches. This fork mirrors only `master` for now; the others are tracked via `upstream/*` and ignored unless a rebase target changes.
+The `divvun/windivvun-service` upstream uses `master`, `develop`, `release`, and `feature/*` branches. This fork mirrors only `master`; the others are tracked via `upstream/*` and ignored unless a rebase target changes.
 
 ## Commits
 
