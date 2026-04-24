@@ -4,10 +4,13 @@
 ; file so upstream rebases do not conflict. See docs/fork-divergence.md.
 ;
 ; Phase 0 scope:
-;  - 32-bit only (matches the unmodified fork's i686-pc-windows-msvc target).
-;  - Ships windivvun.dll + a stub mn.bhfst. No divvunspellmso.dll
-;    (that would be needed for Office 2010-2019 Custom Proofing registration,
-;    and we are not building it in Phase 0 — Office 365 uses WSCAPI directly).
+;  - Both 32-bit and 64-bit windivvun.dll. WSCAPI provider DLLs must match
+;    the bitness of the app loading them (64-bit Word needs 64-bit DLL;
+;    32-bit Office or UWP apps need 32-bit). Registered in both HKLM32 +
+;    HKLM64 registry views so Windows finds the right one per caller.
+;  - Ships a stub mn.bhfst. No divvunspellmso.dll (Office 2010-2019 Custom
+;    Proofing registration is deferred past Phase 0 — Office 365 uses
+;    WSCAPI directly).
 ;  - Ships no spelli.exe — this script does all the registry writes inline.
 ;  - Unsigned per ADR-0003.
 
@@ -39,15 +42,17 @@ Compression=lzma
 SolidCompression=yes
 MinVersion=6.3.9200
 PrivilegesRequired=admin
-ArchitecturesInstallIn64BitMode=
-ArchitecturesAllowed=x86 x64
+ArchitecturesInstallIn64BitMode=x64compatible
+ArchitecturesAllowed=x86 x64compatible
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
-; 32-bit windivvun DLL — loaded by Word / Outlook / UWP via WSCAPI.
+; 32-bit windivvun DLL — loaded by 32-bit apps (legacy Office, some UWP hosts).
 Source: "target\release\windivvun.dll"; DestDir: "{app}\i686\"; Flags: ignoreversion restartreplace uninsrestartdelete
+; 64-bit windivvun DLL — loaded by 64-bit Word / Outlook / most Office 365 installs.
+Source: "target\x86_64-pc-windows-msvc\release\windivvun.dll"; DestDir: "{app}\x86_64\"; Flags: ignoreversion restartreplace uninsrestartdelete; Check: IsWin64
 ; Stub Mongolian speller — flags every word, suggests the input back.
 ; Will be replaced by a real Mongolian FST in Phase 1.
 Source: "Spellers\mn.bhfst"; DestDir: "{app}\Spellers\"; Flags: ignoreversion
@@ -56,19 +61,27 @@ Source: "Spellers\mn.bhfst"; DestDir: "{app}\Spellers\"; Flags: ignoreversion
 Name: "{app}\Spellers"
 
 [Registry]
-; WSCAPI provider discovery. Windows reads this key to find our
-; ISpellCheckProviderFactory and instantiate it via the CLSID below.
-; Rename from upstream's "Divvun" to "monspell" so we do not clobber a
-; WinDivvun install on the same machine.
-Root: HKLM; Subkey: "SOFTWARE\Microsoft\Spelling\Spellers\monspell"; ValueType: string; ValueName: "CLSID"; ValueData: "{#Clsid}"; Flags: uninsdeletekey
+; ====================================================================
+; 64-bit registrations (HKLM64 = native view on x64 Windows).
+; Loaded by 64-bit Word / Outlook / 64-bit UWP apps.
+; ====================================================================
+Root: HKLM64; Subkey: "SOFTWARE\Microsoft\Spelling\Spellers\monspell"; ValueType: string; ValueName: "CLSID"; ValueData: "{#Clsid}"; Flags: uninsdeletekey; Check: IsWin64
+Root: HKLM64; Subkey: "SOFTWARE\Classes\CLSID\{#Clsid}"; ValueType: string; ValueName: ""; ValueData: "monspell Spell Checking Service"; Flags: uninsdeletekey; Check: IsWin64
+Root: HKLM64; Subkey: "SOFTWARE\Classes\CLSID\{#Clsid}"; ValueType: string; ValueName: "AppId"; ValueData: "{#Clsid}"; Flags: uninsdeletekey; Check: IsWin64
+Root: HKLM64; Subkey: "SOFTWARE\Classes\CLSID\{#Clsid}\Version"; ValueType: string; ValueName: ""; ValueData: "{#MyAppVersion}"; Flags: uninsdeletekey; Check: IsWin64
+Root: HKLM64; Subkey: "SOFTWARE\Classes\CLSID\{#Clsid}\InProcServer32"; ValueType: string; ValueName: ""; ValueData: "{app}\x86_64\windivvun.dll"; Flags: uninsdeletekey; Check: IsWin64
+Root: HKLM64; Subkey: "SOFTWARE\Classes\CLSID\{#Clsid}\InProcServer32"; ValueType: string; ValueName: "ThreadingModel"; ValueData: "Both"; Flags: uninsdeletekey; Check: IsWin64
 
-; COM class registration. InProcServer32 points Windows at the DLL to load
-; when an app asks for this CLSID.
-Root: HKLM; Subkey: "SOFTWARE\Classes\CLSID\{#Clsid}"; ValueType: string; ValueName: ""; ValueData: "monspell Spell Checking Service"; Flags: uninsdeletekey
-Root: HKLM; Subkey: "SOFTWARE\Classes\CLSID\{#Clsid}"; ValueType: string; ValueName: "AppId"; ValueData: "{#Clsid}"; Flags: uninsdeletekey
-Root: HKLM; Subkey: "SOFTWARE\Classes\CLSID\{#Clsid}\Version"; ValueType: string; ValueName: ""; ValueData: "{#MyAppVersion}"; Flags: uninsdeletekey
-Root: HKLM; Subkey: "SOFTWARE\Classes\CLSID\{#Clsid}\InProcServer32"; ValueType: string; ValueName: ""; ValueData: "{app}\i686\windivvun.dll"; Flags: uninsdeletekey
-Root: HKLM; Subkey: "SOFTWARE\Classes\CLSID\{#Clsid}\InProcServer32"; ValueType: string; ValueName: "ThreadingModel"; ValueData: "Both"; Flags: uninsdeletekey
+; ====================================================================
+; 32-bit registrations (HKLM32 = WOW6432Node on x64 Windows, native on x86).
+; Loaded by 32-bit Office or 32-bit apps calling WSCAPI.
+; ====================================================================
+Root: HKLM32; Subkey: "SOFTWARE\Microsoft\Spelling\Spellers\monspell"; ValueType: string; ValueName: "CLSID"; ValueData: "{#Clsid}"; Flags: uninsdeletekey
+Root: HKLM32; Subkey: "SOFTWARE\Classes\CLSID\{#Clsid}"; ValueType: string; ValueName: ""; ValueData: "monspell Spell Checking Service"; Flags: uninsdeletekey
+Root: HKLM32; Subkey: "SOFTWARE\Classes\CLSID\{#Clsid}"; ValueType: string; ValueName: "AppId"; ValueData: "{#Clsid}"; Flags: uninsdeletekey
+Root: HKLM32; Subkey: "SOFTWARE\Classes\CLSID\{#Clsid}\Version"; ValueType: string; ValueName: ""; ValueData: "{#MyAppVersion}"; Flags: uninsdeletekey
+Root: HKLM32; Subkey: "SOFTWARE\Classes\CLSID\{#Clsid}\InProcServer32"; ValueType: string; ValueName: ""; ValueData: "{app}\i686\windivvun.dll"; Flags: uninsdeletekey
+Root: HKLM32; Subkey: "SOFTWARE\Classes\CLSID\{#Clsid}\InProcServer32"; ValueType: string; ValueName: "ThreadingModel"; ValueData: "Both"; Flags: uninsdeletekey
 
 ; Our DLL scans two hard-coded locations for .bhfst files (see
 ; windivvun-service/src/lib.rs::SPELLER_REPOSITORY). The second one is
