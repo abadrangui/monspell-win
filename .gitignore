@@ -4,3 +4,6 @@
 installer/output
 dicts
 .vscode
+
+# monspell additions
+/dist/
