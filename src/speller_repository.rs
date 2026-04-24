@@ -15,6 +15,16 @@ lazy_static! {
             }
             map.insert(tag.to_string(), tags);
         }
+        // Mongolian (Khalkha, Cyrillic). mn-Mong-* is deferred.
+        map.insert(
+            "mn".to_string(),
+            vec![
+                "mn".to_string(),
+                "mn-MN".to_string(),
+                "mn-Cyrl".to_string(),
+                "mn-Cyrl-MN".to_string(),
+            ],
+        );
         map
     };
 }
@@ -116,5 +126,35 @@ impl SpellerRepository {
         }
 
         None
+    }
+}
+
+#[test]
+fn mongolian_tag_expansion() {
+    let tags = HARDCODED_TAG_TABLE
+        .get("mn")
+        .expect("mn not in HARDCODED_TAG_TABLE");
+    for expected in &["mn", "mn-MN", "mn-Cyrl", "mn-Cyrl-MN"] {
+        assert!(
+            tags.iter().any(|t| t == expected),
+            "expected {:?} in mn tag expansion, got {:?}",
+            expected,
+            tags
+        );
+    }
+}
+
+#[test]
+fn sami_baseline_preserved() {
+    for neutral in &["se", "sma", "smn", "sms", "smj"] {
+        let tags = HARDCODED_TAG_TABLE
+            .get(*neutral)
+            .unwrap_or_else(|| panic!("{} missing from HARDCODED_TAG_TABLE", neutral));
+        assert!(
+            tags.iter().any(|t| t == &format!("{}-Latn-NO", neutral)),
+            "expected {}-Latn-NO in {} expansion",
+            neutral,
+            neutral
+        );
     }
 }
