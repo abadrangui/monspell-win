@@ -203,11 +203,12 @@ pub extern "system" fn SpellerCloseLex(
 /// `ret 10h` → 4 args. StyleCop: `(id, scmd, wsib_in, wsrb_out)`.
 ///
 /// **This is the function that decides whether Word renders squiggles from
-/// CSAPI.** We return `sstat = 0` (no errors found), `csz = 0` (no
-/// suggestions), and claim we consumed the whole input buffer. Word then
-/// marks the span as clean on its CSAPI codepath — and for modern Office
-/// (2016+) it also dispatches the span through WSCAPI, which is where our
-/// actual spellchecker (windivvun.dll / mn.bhfst) produces squiggles.
+/// CSAPI.** For a CSAPI-gated language, Word uses CSAPI exclusively and
+/// does *not* fall through to WSCAPI for spell-check results — so a
+/// say-yes-to-everything stub means no squiggles. Phase-0 demo behaviour:
+/// flag the entire supplied buffer as one misspelled span. That proves
+/// the CSAPI→Word render pipeline end-to-end. Phase-1 work replaces this
+/// with a real divvunspell-backed check against `mn.bhfst`.
 #[no_mangle]
 pub unsafe extern "system" fn SpellerCheck(
     _id: *mut c_void,
@@ -220,10 +221,10 @@ pub unsafe extern "system" fn SpellerCheck(
     }
     let consumed = (*wsib).cchUse as UINT;
     (*wsrb).ichError = 0;
-    (*wsrb).cchError = 0;
+    (*wsrb).cchError = consumed; // whole buffer flagged
     (*wsrb).ichProcess = consumed;
     (*wsrb).cchProcess = consumed;
-    (*wsrb).sstat = 0; // SpellerStatus::NoErrors
+    (*wsrb).sstat = 1; // SpellerStatus::UnknownInputWord (misspelled)
     (*wsrb).csz = 0;
     (*wsrb).cszAlloc = 0;
     (*wsrb).cchMac = 0;

@@ -141,3 +141,112 @@ Root: HKLM32; Subkey: "SOFTWARE\Microsoft\Shared Tools\Proofing Tools\1.0\Overri
 
 Root: HKLM32; Subkey: "SOFTWARE\Microsoft\Shared Tools\Proofing Tools\Spelling\1104\Normal"; ValueType: string; ValueName: "Engine";     ValueData: "{app}\i686\monspell_mso.dll"; Flags: uninsdeletekey
 Root: HKLM32; Subkey: "SOFTWARE\Microsoft\Shared Tools\Proofing Tools\Spelling\1104\Normal"; ValueType: string; ValueName: "Dictionary"; ValueData: "{app}\Spellers\mn.lex";           Flags: uninsdeletekey
+
+[Code]
+// ========================================================================
+// Office User Settings + Create + Count propagation.
+//
+// Direct writes to Override\mn-MN / Spelling\1104\Normal above work on
+// classic MSI Office installs, but Office 365 Click-to-Run virtualises
+// those paths into its own private registry tree at
+//   HKLM\SOFTWARE\Microsoft\Office\ClickToRun\REGISTRY\MACHINE\Software\...
+// Direct writes into that virtualised tree are also ignored — Word does
+// not pick them up.
+//
+// The documented workaround (used by Divvun's `spelli`) is User Settings
+// propagation: write the target keys under
+//   <OfficeRoot>\User Settings\<app>\Create\<target_subpath>
+// plus a `Count` DWORD on the User Settings\<app> key. When Word starts
+// it reads pending Create subtrees and applies them to their real targets,
+// which Office's registry layer routes to the right place regardless of
+// whether the install is MSI or C2R.
+//
+// We cover four Office 16.0 roots so the install works on Office 365 C2R
+// (both 64-bit and 32-bit) and classic MSI Office 2016/2019 (both views):
+//   - SOFTWARE\Microsoft\Office\16.0
+//   - SOFTWARE\Wow6432Node\Microsoft\Office\16.0
+//   - SOFTWARE\Microsoft\Office\ClickToRun\REGISTRY\MACHINE\Software\Microsoft\Office\16.0
+//   - SOFTWARE\Microsoft\Office\ClickToRun\REGISTRY\MACHINE\Software\Wow6432Node\Microsoft\Office\16.0
+// Office 14.0 / 15.0 (2010 / 2013) are out of scope for Phase 0.
+// ========================================================================
+
+function GetMonspellCount(Param: String): String;
+begin
+  // `Count` is the signal to Office that User Settings\<app>\Create has
+  // un-applied entries. We only need a non-zero DWORD that differs between
+  // fresh installs. yyMMddHHmm packs into 10 digits → max ~9912312359, which
+  // fits in u32 (max 4294967295) from year 2043 backwards; fine for our
+  // lifetime. GetDateTimeString is Inno's Pascal-runtime-safe way to read
+  // system time without TSystemTime bindings.
+  Result := GetDateTimeString('yymmddhhnn', #0, #0);
+end;
+
+procedure WriteProofingOverride(RootKey: Integer; BasePath: String; InstallPath: String);
+var
+  CreatePath: String;
+  UsKey: String;
+  LangTag: String;
+  LangTags: array of String;
+  i: Integer;
+begin
+  UsKey := BasePath + '\User Settings\monspell';
+
+  // Count + Order on the parent node — this is the signal to Office to
+  // apply the Create subtree on next startup.
+  RegWriteDWordValue(RootKey, UsKey, 'Count', StrToInt(GetMonspellCount('')));
+  RegWriteDWordValue(RootKey, UsKey, 'Order', 1);
+
+  // One Override\<tag> per BCP-47 variant Word might present.
+  // Mongolian (Cyrillic) tags per docs/GLOSSARY.md § "Language tags".
+  SetArrayLength(LangTags, 4);
+  LangTags[0] := 'mn';
+  LangTags[1] := 'mn-MN';
+  LangTags[2] := 'mn-Cyrl';
+  LangTags[3] := 'mn-Cyrl-MN';
+
+  for i := 0 to GetArrayLength(LangTags) - 1 do begin
+    LangTag := LangTags[i];
+    CreatePath := UsKey + '\Create\SOFTWARE\Microsoft\Shared Tools\Proofing Tools\1.0\Override\' + LangTag;
+    RegWriteStringValue(RootKey, CreatePath, 'DLL64', InstallPath + '\x86_64\monspell_mso.dll');
+    RegWriteStringValue(RootKey, CreatePath, 'LEX64', InstallPath + '\Spellers\mn.lex');
+    RegWriteStringValue(RootKey, CreatePath, 'DLL',   InstallPath + '\i686\monspell_mso.dll');
+    RegWriteStringValue(RootKey, CreatePath, 'LEX',   InstallPath + '\Spellers\mn.lex');
+  end;
+
+  // Engine + Dictionary under Spelling\1104\Normal for LCID 0x0450 (mn-MN).
+  CreatePath := UsKey + '\Create\SOFTWARE\Microsoft\Shared Tools\Proofing Tools\Spelling\1104\Normal';
+  RegWriteStringValue(RootKey, CreatePath, 'Engine',     InstallPath + '\x86_64\monspell_mso.dll');
+  RegWriteStringValue(RootKey, CreatePath, 'Dictionary', InstallPath + '\Spellers\mn.lex');
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  InstallPath: String;
+begin
+  if CurStep <> ssPostInstall then Exit;
+  InstallPath := ExpandConstant('{app}');
+
+  // HKLM 64-bit view, classic (MSI) Office 16.0
+  WriteProofingOverride(HKLM64, 'SOFTWARE\Microsoft\Office\16.0', InstallPath);
+  // HKLM 32-bit view (Wow6432Node), classic (MSI) Office 16.0
+  WriteProofingOverride(HKLM64, 'SOFTWARE\Wow6432Node\Microsoft\Office\16.0', InstallPath);
+  // Office 365 Click-to-Run virtual registry, 64-bit side
+  WriteProofingOverride(HKLM64, 'SOFTWARE\Microsoft\Office\ClickToRun\REGISTRY\MACHINE\Software\Microsoft\Office\16.0', InstallPath);
+  // Office 365 Click-to-Run virtual registry, 32-bit side
+  WriteProofingOverride(HKLM64, 'SOFTWARE\Microsoft\Office\ClickToRun\REGISTRY\MACHINE\Software\Wow6432Node\Microsoft\Office\16.0', InstallPath);
+end;
+
+procedure CleanupProofingOverride(RootKey: Integer; BasePath: String);
+begin
+  // Delete the entire User Settings\monspell subtree on uninstall.
+  RegDeleteKeyIncludingSubkeys(RootKey, BasePath + '\User Settings\monspell');
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep <> usUninstall then Exit;
+  CleanupProofingOverride(HKLM64, 'SOFTWARE\Microsoft\Office\16.0');
+  CleanupProofingOverride(HKLM64, 'SOFTWARE\Wow6432Node\Microsoft\Office\16.0');
+  CleanupProofingOverride(HKLM64, 'SOFTWARE\Microsoft\Office\ClickToRun\REGISTRY\MACHINE\Software\Microsoft\Office\16.0');
+  CleanupProofingOverride(HKLM64, 'SOFTWARE\Microsoft\Office\ClickToRun\REGISTRY\MACHINE\Software\Wow6432Node\Microsoft\Office\16.0');
+end;
