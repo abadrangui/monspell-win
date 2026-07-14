@@ -64,6 +64,13 @@ Source: "mso\target\release\monspell_mso.dll"; DestDir: "{app}\i686\"; Flags: ig
 Source: "mso\target\x86_64-pc-windows-msvc\release\monspell_mso.dll"; DestDir: "{app}\x86_64\"; Flags: ignoreversion restartreplace uninsrestartdelete; Check: IsWin64
 ; WSCAPI speller data — stub, flags every word.
 Source: "Spellers\mn.bhfst"; DestDir: "{app}\Spellers\"; Flags: ignoreversion
+; Engine data for monspell_mso.dll (real CSAPI spell-check via monspell-core).
+; Stage before building: mn_MN.aff/mn_MN.dic from abadrangui/dict-mn (LPPL-1.3c,
+; redistribution permitted), freq.tsv = corpus/derived/lawcorpus-freq.tsv from
+; the monspell repo.
+Source: "Spellers\mn_MN.aff"; DestDir: "{app}\Spellers\"; Flags: ignoreversion
+Source: "Spellers\mn_MN.dic"; DestDir: "{app}\Spellers\"; Flags: ignoreversion
+Source: "Spellers\freq.tsv"; DestDir: "{app}\Spellers\"; Flags: ignoreversion skipifsourcedoesntexist
 ; CSAPI lexicon placeholder — empty; our CSAPI stub never reads it, but Word
 ; wants the registered LEX path to exist on disk before it will load the DLL.
 Source: "Spellers\mn.lex"; DestDir: "{app}\Spellers\"; Flags: ignoreversion

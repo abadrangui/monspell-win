@@ -1,14 +1,19 @@
 [package]
 name = "monspell-mso"
-description = "Office Custom Proofing Tool (CSAPI) say-yes stub for monspell. Unlocks Word's language gate so WSCAPI (windivvun.dll) handles actual spell-check."
-version = "0.1.0-beta"
+description = "Office Custom Proofing Tool (CSAPI) shim for monspell: real per-word spell-check + suggestions via monspell-core."
+version = "0.2.0-beta"
 authors = ["abadrangui <abadrangui@gmail.com>"]
 license = "GPL-3.0"
-edition = "2018"
+edition = "2021"
+
+[dependencies]
+# Private repo for now: CI patches this to a local checkout via --config
+# 'patch."https://github.com/abadrangui/monspell".monspell-core.path=...'
+monspell-core = { git = "https://github.com/abadrangui/monspell", branch = "main" }
 
 [lib]
 name = "monspell_mso"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [profile.release]
 opt-level = 3

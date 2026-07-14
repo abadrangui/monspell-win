@@ -28,8 +28,11 @@
 #![allow(non_camel_case_types)]
 #![allow(clippy::missing_safety_doc)]
 
+mod engine;
+
 use core::ffi::c_void;
 use core::ptr;
+use monspell_core::CheckResult;
 
 // ---- Win32 basic types ----
 type UINT = u32;
@@ -90,10 +93,21 @@ pub struct WSIB {
     pub cchUse: usize,
 }
 
+/// Layout per StyleCop's `SpellerSuggestion`: a pointer into the CALLER's
+/// `WSRB.pwsz` buffer plus the (offset, length) of the same span, and a
+/// rating (higher = better).
+#[repr(C)]
+pub struct SPELLERSUGGESTION {
+    pub pwsz: LPCWSTR,
+    pub ichSugg: UINT,
+    pub cchSugg: UINT,
+    pub rating: UINT,
+}
+
 #[repr(C)]
 pub struct WSRB {
     pub pwsz: LPWSTR,
-    pub prgsugg: *mut c_void,
+    pub prgsugg: *mut SPELLERSUGGESTION,
     pub ichError: UINT,
     pub cchError: UINT,
     pub ichProcess: UINT,
@@ -104,6 +118,17 @@ pub struct WSRB {
     pub cchMac: UINT,
     pub cchAlloc: UINT,
 }
+
+// SpellerCommand values (StyleCop SpellChecker.cs).
+const SCMD_VERIFY_BUFFER: UINT = 2;
+const SCMD_SUGGEST: UINT = 3;
+const SCMD_SUGGEST_MORE: UINT = 4;
+const SCMD_VERIFY_BUFFER_AUTOREPLACE: UINT = 10;
+
+// SpellerStatus values (StyleCop SpellChecker.cs).
+const SSTAT_NO_ERRORS: i32 = 0;
+const SSTAT_UNKNOWN_INPUT_WORD: i32 = 1;
+const SSTAT_NO_MORE_SUGGESTIONS: i32 = 8;
 
 // ---- Exports ----
 //
@@ -203,32 +228,110 @@ pub extern "system" fn SpellerCloseLex(
 /// `ret 10h` → 4 args. StyleCop: `(id, scmd, wsib_in, wsrb_out)`.
 ///
 /// **This is the function that decides whether Word renders squiggles from
-/// CSAPI.** For a CSAPI-gated language, Word uses CSAPI exclusively and
-/// does *not* fall through to WSCAPI for spell-check results — so a
-/// say-yes-to-everything stub means no squiggles. Phase-0 demo behaviour:
-/// flag the entire supplied buffer as one misspelled span. That proves
-/// the CSAPI→Word render pipeline end-to-end. Phase-1 work replaces this
-/// with a real divvunspell-backed check against `mn.bhfst`.
+/// CSAPI.** For a CSAPI-gated language, Word uses CSAPI exclusively — no
+/// WSCAPI fallthrough. Phase 1: real per-word checking + suggestions via
+/// monspell-core (dict-mn Hunspell + optional lang-khk FST).
+///
+/// Output-buffer contract (StyleCop SpellChecker.cs): the CALLER owns
+/// `wsrb.pwsz` (capacity `cchAlloc` UTF-16 units) and `wsrb.prgsugg`
+/// (capacity `cszAlloc` entries). We only ever write inside those bounds —
+/// the Phase 0 crash came from declaring results without valid buffers.
+/// If the engine is unavailable, everything reports "no errors" (degrade
+/// silently rather than crash or false-flag).
 #[no_mangle]
 pub unsafe extern "system" fn SpellerCheck(
     _id: *mut c_void,
-    _scmd: UINT,
+    scmd: UINT,
     wsib: *const WSIB,
     wsrb: *mut WSRB,
 ) -> PTEC {
     if wsib.is_null() || wsrb.is_null() {
         return 0;
     }
-    let consumed = (*wsib).cchUse as UINT;
-    (*wsrb).ichError = 0;
-    (*wsrb).cchError = consumed; // whole buffer flagged
-    (*wsrb).ichProcess = consumed;
-    (*wsrb).cchProcess = consumed;
-    (*wsrb).sstat = 1; // SpellerStatus::UnknownInputWord (misspelled)
-    (*wsrb).csz = 0;
-    (*wsrb).cszAlloc = 0;
-    (*wsrb).cchMac = 0;
-    (*wsrb).cchAlloc = 0;
+    let wsib = &*wsib;
+    let out = &mut *wsrb;
+
+    // Slice of the input actually under check: pwsz[ichStart .. ichStart+cchUse].
+    let (units, ich_start): (&[u16], u32) = if wsib.pwsz.is_null() || wsib.cchUse == 0 {
+        (&[], 0)
+    } else {
+        let start = wsib.ichStart as usize;
+        (
+            core::slice::from_raw_parts(wsib.pwsz.add(start), wsib.cchUse),
+            wsib.ichStart,
+        )
+    };
+
+    // Defaults: clean result over the whole input.
+    out.ichError = 0;
+    out.cchError = 0;
+    out.ichProcess = ich_start;
+    out.cchProcess = units.len() as UINT;
+    out.sstat = SSTAT_NO_ERRORS;
+    out.csz = 0;
+    out.cchMac = 0;
+
+    match scmd {
+        SCMD_VERIFY_BUFFER | SCMD_VERIFY_BUFFER_AUTOREPLACE => {
+            let hit = engine::with_engine(|speller| {
+                engine::tokens_utf16(units).into_iter().find(|t| {
+                    matches!(speller.check_word(&t.text), CheckResult::Misspelled { .. })
+                })
+            })
+            .flatten();
+            if let Some(token) = hit {
+                out.ichError = ich_start + token.start;
+                out.cchError = token.len;
+                // Report progress up to the end of the flagged word so the
+                // caller resumes after it and later errors surface too.
+                out.cchProcess = token.start + token.len;
+                out.sstat = SSTAT_UNKNOWN_INPUT_WORD;
+            }
+        }
+        SCMD_SUGGEST => {
+            // Word passes the misspelled word as the buffer; suggestions are
+            // written into the caller's pwsz arena, described by prgsugg.
+            let word = String::from_utf16_lossy(units);
+            let word = word.trim();
+            let suggestions = engine::with_engine(|speller| speller.suggest(word))
+                .unwrap_or_default();
+            out.sstat = SSTAT_UNKNOWN_INPUT_WORD;
+            if suggestions.is_empty() || out.pwsz.is_null() || out.prgsugg.is_null() {
+                out.sstat = SSTAT_NO_MORE_SUGGESTIONS;
+                return 0;
+            }
+            let arena_cap = out.cchAlloc as usize;
+            let sugg_cap = out.cszAlloc as usize;
+            let mut used = 0usize;
+            let mut count = 0usize;
+            for (i, s) in suggestions.iter().enumerate() {
+                if count >= sugg_cap {
+                    break;
+                }
+                let utf16: Vec<u16> = s.encode_utf16().collect();
+                // +1 for a terminating NUL between entries.
+                if used + utf16.len() + 1 > arena_cap {
+                    break;
+                }
+                let dst = out.pwsz.add(used);
+                core::ptr::copy_nonoverlapping(utf16.as_ptr(), dst, utf16.len());
+                *dst.add(utf16.len()) = 0;
+                let entry = out.prgsugg.add(count);
+                (*entry).pwsz = dst;
+                (*entry).ichSugg = used as UINT;
+                (*entry).cchSugg = utf16.len() as UINT;
+                (*entry).rating = 255u32.saturating_sub(i as u32);
+                used += utf16.len() + 1;
+                count += 1;
+            }
+            out.csz = count as UINT;
+            out.cchMac = used as UINT;
+        }
+        SCMD_SUGGEST_MORE => {
+            out.sstat = SSTAT_NO_MORE_SUGGESTIONS;
+        }
+        _ => {}
+    }
     0
 }
 
