@@ -6,6 +6,11 @@ authors = ["abadrangui <abadrangui@gmail.com>"]
 license = "GPL-3.0"
 edition = "2021"
 
+# Standalone crate: without this, cargo adopts any enclosing workspace —
+# monspell's CI clones this fork inside the monspell checkout and the build
+# fails with "current package believes it's in a workspace".
+[workspace]
+
 [dependencies]
 # Private repo for now: CI patches this to a local checkout via --config
 # 'patch."https://github.com/abadrangui/monspell".monspell-core.path=...'
