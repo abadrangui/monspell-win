@@ -8,6 +8,7 @@ extern crate tracing;
 #[macro_use]
 extern crate lazy_static;
 
+mod guard;
 mod util;
 use crate::util::fmt_guid;
 
@@ -16,7 +17,7 @@ mod spellcheckprovider;
 
 use winapi::shared::guiddef::{IsEqualGUID, REFCLSID, REFIID};
 use winapi::shared::ntdef::HRESULT;
-use winapi::shared::winerror::{CLASS_E_CLASSNOTAVAILABLE, S_FALSE, S_OK};
+use winapi::shared::winerror::{CLASS_E_CLASSNOTAVAILABLE, E_POINTER, S_FALSE, S_OK};
 use winapi::um::consoleapi::AllocConsole;
 use winapi::um::winnt::PVOID;
 use winapi::um::winnt::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH};
@@ -27,6 +28,8 @@ use std::path::{Path, PathBuf};
 use crate::spell_impl::ClassFactory::DivvunSpellCheckProviderFactoryClassFactory;
 use winapi::um::unknwnbase::IClassFactory;
 
+mod engine;
+mod monspell_bridge;
 mod speller_cache;
 mod speller_repository;
 mod wordlists;
@@ -50,11 +53,7 @@ lazy_static! {
         }
 
         // Program Files dictionaries
-        {
-            let path = PathBuf::from(util::get_module_path().unwrap())
-                .parent().unwrap()
-                .parent().unwrap()
-                .join("Spellers");
+        if let Some(path) = install_root().map(|root| root.join("Spellers")) {
             if let Some(path) = path.to_str() {
                 dictionaries.push(path.to_string());
             }
@@ -65,23 +64,27 @@ lazy_static! {
     };
 }
 
-fn initialize_logging() -> anyhow::Result<(), ()> {
-    let debug_path = PathBuf::from(util::get_module_path().unwrap())
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("debug");
+/// `<install root>`: the parent of the per-architecture directory this DLL
+/// is loaded from. `None` if the module path cannot be resolved.
+fn install_root() -> Option<PathBuf> {
+    util::module_dir()?.parent().map(|root| root.to_path_buf())
+}
+
+fn initialize_logging() {
+    let debug_path = match install_root() {
+        Some(root) => root.join("debug"),
+        None => return,
+    };
     if debug_path.exists() {
         unsafe { AllocConsole() };
-        tracing_subscriber::fmt::fmt()
+        // try_init: an already-installed subscriber is not worth a panic.
+        let _ = tracing_subscriber::fmt::fmt()
             .with_env_filter("windivvun=trace")
-            .init();
+            .try_init();
         debug!("# Logging initialized");
         debug!(r"[!] To disable, delete: {} [!]", debug_path.display());
         debug!("User: {}", whoami::username());
     }
-    Ok(())
 }
 
 #[cfg(windows)]
@@ -103,37 +106,49 @@ fn print_message(msg: &str) -> Result<i32, std::io::Error> {
 
 #[no_mangle]
 extern "stdcall" fn DllCanUnloadNow() -> HRESULT {
-    info!("DllCanUnloadNow");
-    // TODO: HMMMMMMMM
-    S_FALSE
+    guard::contain("DllCanUnloadNow", S_FALSE, || {
+        info!("DllCanUnloadNow");
+        // TODO: HMMMMMMMM
+        S_FALSE
+    })
 }
 
 #[no_mangle]
 extern "stdcall" fn DllMain(module: u32, reason_for_call: u32, reserved: PVOID) -> bool {
-    std::env::set_var("RUST_BACKTRACE", "full");
-    match reason_for_call {
-        DLL_PROCESS_ATTACH => {
-            initialize_logging().unwrap();
+    // A panic here must not fail the load or unwind into the loader.
+    guard::contain("DllMain", true, || {
+        std::env::set_var("RUST_BACKTRACE", "full");
+        match reason_for_call {
+            DLL_PROCESS_ATTACH => {
+                guard::install_panic_hook();
+                initialize_logging();
 
-            info!("Library loaded! procid = {}", std::process::id());
-            info!("{:?}", std::env::current_dir());
-            info!("{:?}", std::env::current_exe());
+                info!("Library loaded! procid = {}", std::process::id());
+                info!("{:?}", std::env::current_dir());
+                info!("{:?}", std::env::current_exe());
 
-            // print_message("load");
+                // print_message("load");
+            }
+            DLL_PROCESS_DETACH => {
+                info!("Library unloaded :(");
+            }
+            _ => (),
         }
-        DLL_PROCESS_DETACH => {
-            info!("Library unloaded :(");
-        }
-        _ => (),
-    }
 
-    true
+        true
+    })
 }
 
 #[no_mangle]
 extern "stdcall" fn DllGetClassObject(rclsid: REFCLSID, riid: REFIID, ppv: *mut PVOID) -> HRESULT {
-    unsafe {
+    guard::hresult("DllGetClassObject", || unsafe {
+        if ppv.is_null() {
+            return E_POINTER;
+        }
         *ppv = std::ptr::null_mut();
+        if rclsid.is_null() || riid.is_null() {
+            return E_POINTER;
+        }
 
         info!("DllGetClassObject");
 
@@ -147,7 +162,6 @@ extern "stdcall" fn DllGetClassObject(rclsid: REFCLSID, riid: REFIID, ppv: *mut 
         }
 
         error!("Invalid interface requested");
-    }
-
-    CLASS_E_CLASSNOTAVAILABLE
+        CLASS_E_CLASSNOTAVAILABLE
+    })
 }

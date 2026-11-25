@@ -16,3 +16,9 @@ EXPORTS
     SpellerGetListUdr
     SpellerBuiltinUdr
     DllCanUnloadNow
+    MonspellWscAbiVersion
+    MonspellWscLoad
+    MonspellWscLoadError
+    MonspellWscNextToken
+    MonspellWscIsCorrect
+    MonspellWscSuggest

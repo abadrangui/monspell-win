@@ -2,10 +2,17 @@
 //! process-wide monspell_core::Speller, hand out synchronized access.
 
 use monspell_core::{Speller, SpellerConfig};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
-static ENGINE: OnceLock<Option<Mutex<Speller>>> = OnceLock::new();
+static ENGINE: OnceLock<Mutex<Speller>> = OnceLock::new();
+/// When the last load attempt failed, and why. Also the lock that makes
+/// loading single-file.
+static LAST_FAILURE: Mutex<Option<(Instant, String)>> = Mutex::new(None);
+/// A failed load is retried, but not on every call: each attempt parses an
+/// 18 MB dictionary.
+const RETRY_AFTER: Duration = Duration::from_secs(5);
 
 /// Engine data directory, in priority order:
 /// 1. `MONSPELL_ENGINE_DIR` (tests, debugging)
@@ -89,26 +96,99 @@ fn dll_dir() -> Option<PathBuf> {
 /// unavailable (no dictionary found / failed to load) — callers degrade to
 /// the say-yes stub behaviour, never crash Word.
 pub fn with_engine<R>(f: impl FnOnce(&Speller) -> R) -> Option<R> {
-    let slot = ENGINE.get_or_init(|| {
-        let dir = engine_dir()?;
-        let mut config = SpellerConfig::new(dir.join("mn_MN.aff"), dir.join("mn_MN.dic"));
-        let fst = dir.join("mn.bhfst");
-        if fst.exists() {
-            config.fst_archive = Some(fst);
-        }
-        let freq = dir.join("freq.tsv");
-        if freq.exists() {
-            config.frequency_list = Some(freq);
-        }
-        Speller::new(config).ok().map(Mutex::new)
-    });
-    match slot {
-        Some(mutex) => match mutex.lock() {
-            Ok(guard) => Some(f(&guard)),
-            Err(_) => None,
-        },
-        None => None,
+    // A poisoned lock only means an earlier caller panicked mid-query. `f`
+    // gets `&Speller`, so there is no half-written state to protect; keep
+    // serving instead of going silent for the rest of the process.
+    engine().map(|mutex| {
+        f(&mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()))
+    })
+}
+
+/// Why the engine is unavailable, or `None` when it is loaded. Tries to load
+/// it first if that is due.
+pub fn load_error() -> Option<String> {
+    if engine().is_some() {
+        return None;
     }
+    let failure = LAST_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    failure.as_ref().map(|(_, reason)| reason.clone())
+}
+
+/// The loaded engine. A failed load is not final: a host process can live as
+/// long as some app keeps a spell checker open, and one bad moment at its
+/// start must not cost that whole lifetime.
+fn engine() -> Option<&'static Mutex<Speller>> {
+    if let Some(engine) = ENGINE.get() {
+        return Some(engine);
+    }
+    let mut failure = LAST_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(engine) = ENGINE.get() {
+        return Some(engine);
+    }
+    if matches!(failure.as_ref(), Some((when, _)) if when.elapsed() < RETRY_AFTER) {
+        return None;
+    }
+    match build() {
+        Ok(speller) => {
+            *failure = None;
+            Some(ENGINE.get_or_init(|| Mutex::new(speller)))
+        }
+        Err(reason) => {
+            *failure = Some((Instant::now(), reason));
+            None
+        }
+    }
+}
+
+/// Build the speller from the data in the engine directory.
+///
+/// monspell-core keeps the user's custom dictionary under the roaming
+/// profile and refuses to start when it cannot create that folder. A
+/// sandboxed host cannot: `msspellcheckinghost.exe` runs in an AppContainer
+/// with no access to the user's profile (and the container's own profile is
+/// wiped whenever the host exits, so nothing can live there either). When
+/// the normal constructor fails, build the engine from the same files with
+/// no data directory at all. That path has no custom dictionary and no FST;
+/// it costs one extra dictionary parse (~0.15 s) per sandboxed process.
+fn build() -> Result<Speller, String> {
+    let dir = engine_dir()
+        .ok_or_else(|| "mn_MN.aff + mn_MN.dic not found in any engine directory".to_string())?;
+    let aff = dir.join("mn_MN.aff");
+    let dic = dir.join("mn_MN.dic");
+    let freq = Some(dir.join("freq.tsv")).filter(|path| path.exists());
+
+    let mut config = SpellerConfig::new(&aff, &dic);
+    let fst = dir.join("mn.bhfst");
+    if fst.exists() {
+        config.fst_archive = Some(fst);
+    }
+    config.frequency_list = freq.clone();
+    let max_suggestions = config.max_suggestions;
+
+    let first_error = match Speller::new(config) {
+        Ok(speller) => return Ok(speller),
+        Err(error) => error.to_string(),
+    };
+
+    let read = |path: &Path| {
+        std::fs::read_to_string(path).map_err(|error| {
+            format!(
+                "{first_error}; then failed to read {}: {error}",
+                path.display()
+            )
+        })
+    };
+    let aff = read(&aff)?;
+    let dic = read(&dic)?;
+    let freq = freq.as_deref().map(read).transpose()?;
+    Speller::from_memory(&aff, &dic, freq.as_deref(), None, max_suggestions)
+        .map_err(|error| format!("{first_error}; then without a data directory: {error}"))
 }
 
 /// A token worth checking: contains Cyrillic and no digit contamination.
@@ -121,16 +201,31 @@ pub struct Token {
 }
 
 /// Tokenize a UTF-16 buffer into candidate words: maximal runs of Cyrillic
-/// letters and hyphens. Runs adjacent to ASCII digits (5-ны, 10-р) are
-/// suffix fragments, not words — dropped. Offsets are UTF-16 units so they
-/// map 1:1 onto CSAPI's ich*/cch* fields.
+/// letters and hyphens. Runs adjacent to ASCII digits (5-ны, 10-р), and
+/// hyphen-led runs hanging off a Latin word (Excel-д, PDF-ийг), are suffix
+/// fragments, not words — dropped. Offsets are UTF-16 units so they map 1:1
+/// onto CSAPI's ich*/cch* fields.
 pub fn tokens_utf16(units: &[u16]) -> Vec<Token> {
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some((token, next)) = next_token(units, from) {
+        out.push(token);
+        from = next;
+    }
+    out
+}
+
+/// The first token at or after `from`, plus the offset to resume scanning
+/// from (the end of the token's run, which can lie past the token itself
+/// when trailing hyphens were trimmed). `from` must be 0 or a resume offset
+/// from a previous call, so it never lands inside a run.
+pub fn next_token(units: &[u16], from: usize) -> Option<(Token, usize)> {
     let is_cyr = |u: u16| (0x0400..=0x04FF).contains(&u);
     let is_word = |u: u16| is_cyr(u) || u == b'-' as u16;
     let is_digit = |u: u16| (0x30..=0x39).contains(&u);
+    let is_latin = |u: u16| (0x41..=0x5A).contains(&u) || (0x61..=0x7A).contains(&u);
 
-    let mut out = Vec::new();
-    let mut i = 0usize;
+    let mut i = from;
     while i < units.len() {
         if !is_word(units[i]) {
             i += 1;
@@ -142,6 +237,9 @@ pub fn tokens_utf16(units: &[u16]) -> Vec<Token> {
         }
         let digit_before = start > 0 && is_digit(units[start - 1]);
         let digit_after = i < units.len() && is_digit(units[i]);
+        // Only a hyphen-led run counts: Cyrillic glued straight onto Latin
+        // (a Latin `c` typed for `с`) is a real error and stays checked.
+        let latin_suffix = start > 0 && units[start] == b'-' as u16 && is_latin(units[start - 1]);
         // trim leading/trailing hyphens off the token
         let mut s = start;
         let mut e = i;
@@ -151,13 +249,19 @@ pub fn tokens_utf16(units: &[u16]) -> Vec<Token> {
         while e > s && units[e - 1] == b'-' as u16 {
             e -= 1;
         }
-        if s < e && !digit_before && !digit_after && units[s..e].iter().any(|&u| is_cyr(u)) {
-            out.push(Token {
+        if s < e
+            && !digit_before
+            && !digit_after
+            && !latin_suffix
+            && units[s..e].iter().any(|&u| is_cyr(u))
+        {
+            let token = Token {
                 start: s as u32,
                 len: (e - s) as u32,
                 text: String::from_utf16_lossy(&units[s..e]),
-            });
+            };
+            return Some((token, i));
         }
     }
-    out
+    None
 }

@@ -8,3 +8,10 @@ dicts
 # monspell additions
 /dist/
 /mso/target/
+# Engine data staged for the installer. dict-mn is LPPL-licensed and is
+# shipped as separate files; it must never be committed here or compiled in.
+/Spellers/mn_MN.aff
+/Spellers/mn_MN.dic
+/Spellers/README_mn_MN.txt
+/Spellers/LICENSE-dict-mn.txt
+/Spellers/freq.tsv

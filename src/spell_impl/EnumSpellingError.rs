@@ -3,12 +3,12 @@
 
 use winapi::shared::guiddef::{IsEqualGUID, GUID};
 use winapi::shared::ntdef::ULONG;
-use winapi::shared::winerror::{S_FALSE, S_OK};
+use winapi::shared::winerror::{E_OUTOFMEMORY, E_POINTER, S_FALSE, S_OK};
 use winapi::um::winnt::{HRESULT, LPCWSTR};
 
 use winapi::um::unknwnbase::{IUnknown, IUnknownVtbl};
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::spellcheckprovider::{
     IEnumSpellingError, IEnumSpellingErrorVtbl, ISpellingError, ISpellingErrorVtbl,
@@ -17,9 +17,8 @@ use crate::spellcheckprovider::{
 
 use com_impl::{implementation, interface, ComInterface};
 
-use divvunspell::tokenizer::Tokenize;
-
-use crate::speller_cache::SpellerCache;
+use crate::engine::{Engine, Token};
+use crate::guard;
 use crate::util;
 use crate::wordlists::Wordlists;
 use std::sync::Arc;
@@ -30,7 +29,7 @@ pub struct DivvunSpellingError {
     start_index: u32,
     length: u32,
     corrective_action: u32,
-    replacement: Vec<u16>,
+    replacement: Option<String>,
 }
 
 IMPL_UNKNOWN!(ISpellingError, DivvunSpellingError);
@@ -38,42 +37,69 @@ IMPL_UNKNOWN!(ISpellingError, DivvunSpellingError);
 #[implementation(ISpellingError)]
 impl DivvunSpellingError {
     fn get_StartIndex(&mut self, value: *mut u32) -> HRESULT {
-        // info!("StartIndex, {:?}", self.start_index);
-        unsafe {
-            *value = self.start_index;
-        }
-        S_OK
+        guard::hresult("ISpellingError::get_StartIndex", || {
+            if value.is_null() {
+                return E_POINTER;
+            }
+            // info!("StartIndex, {:?}", self.start_index);
+            unsafe {
+                *value = self.start_index;
+            }
+            S_OK
+        })
     }
 
     fn get_Length(&mut self, value: *mut u32) -> HRESULT {
-        // info!("Length, {:?}", self.length);
-        unsafe {
-            *value = self.length;
-        }
-        S_OK
+        guard::hresult("ISpellingError::get_Length", || {
+            if value.is_null() {
+                return E_POINTER;
+            }
+            // info!("Length, {:?}", self.length);
+            unsafe {
+                *value = self.length;
+            }
+            S_OK
+        })
     }
 
     fn get_CorrectiveAction(&mut self, value: *mut u32) -> HRESULT {
-        // info!("CorrectiveAction, {:?}", self.corrective_action);
-        unsafe {
-            *value = self.corrective_action;
-        }
-        S_OK
+        guard::hresult("ISpellingError::get_CorrectiveAction", || {
+            if value.is_null() {
+                return E_POINTER;
+            }
+            // info!("CorrectiveAction, {:?}", self.corrective_action);
+            unsafe {
+                *value = self.corrective_action;
+            }
+            S_OK
+        })
     }
 
     fn get_Replacement(&mut self, value: *mut LPCWSTR) -> HRESULT {
-        if self.corrective_action != CORRECTIVE_ACTION_REPLACE {
-            // info!("Replacement, null");
+        guard::hresult("ISpellingError::get_Replacement", || {
+            if value.is_null() {
+                return E_POINTER;
+            }
             unsafe {
                 *value = std::ptr::null_mut();
             }
-        } else {
-            // info!("Replacement, something");
-            unsafe {
-                *value = self.replacement.as_ptr();
+            if self.corrective_action != CORRECTIVE_ACTION_REPLACE {
+                // info!("Replacement, null");
+                return S_OK;
             }
-        }
-        S_OK
+            // The caller frees an [out] string with CoTaskMemFree, so it has
+            // to be a COM allocation, never a pointer into this object.
+            let replacement = self.replacement.as_deref().unwrap_or("");
+            match unsafe { util::alloc_com_str(replacement) } {
+                Some(text) => {
+                    unsafe {
+                        *value = text;
+                    }
+                    S_OK
+                }
+                None => E_OUTOFMEMORY,
+            }
+        })
     }
 }
 
@@ -84,9 +110,6 @@ impl DivvunSpellingError {
         corrective_action: u32,
         replacement: Option<String>,
     ) -> *mut DivvunSpellingError {
-        let replacement =
-            replacement.map_or(vec![], |r| util::to_u16s(r).unwrap_or_else(|_| vec![]));
-
         let s = Self {
             __vtable: Box::new(Self::create_vtable()),
             refs: AtomicU32::new(1),
@@ -104,20 +127,13 @@ impl DivvunSpellingError {
     }
 }
 
-fn byte_off_to_idx(text: &str, byte_offset: usize) -> usize {
-    text.char_indices()
-        .enumerate()
-        .find(|(i, (n, _))| *n == byte_offset)
-        .map(|(i, _)| i)
-        .unwrap_or(text.chars().count())
-}
-
 #[interface(IEnumSpellingError)]
 pub struct DivvunEnumSpellingError {
     refs: AtomicU32,
-    speller_cache: Arc<SpellerCache>,
-    text: Arc<String>,
-    text_offset: usize,
+    engine: Arc<Engine>,
+    /// Every word of the checked text, with UTF-16 offsets.
+    tokens: Vec<Token>,
+    next_token: AtomicUsize,
     wordlists: Arc<Wordlists>,
 }
 
@@ -126,102 +142,100 @@ IMPL_UNKNOWN!(IEnumSpellingError, DivvunEnumSpellingError);
 #[implementation(IEnumSpellingError)]
 impl DivvunEnumSpellingError {
     fn Next(&mut self, value: *mut *mut ISpellingError) -> HRESULT {
-        info!("Next");
-
-        let tokenizer_start = self.text_offset;
-
-        let tokens = self.text[tokenizer_start..]
-            .word_bound_indices()
-            .filter(|(i, s)| s.chars().any(|ch| ch.is_alphanumeric()));
-
-        for (start, word) in tokens {
-            info!("Token {}: {:?}", start, word);
-            self.text_offset = tokenizer_start + start + word.len();
-
-            // Check ignore wordlist
-            if self.wordlists.contains_ignore(word) {
-                info!("Wordlist ignore");
-                continue;
+        guard::hresult("IEnumSpellingError::Next", || {
+            if value.is_null() {
+                return E_POINTER;
             }
-
-            let mut action: Option<u32> = None;
-            let mut replacement: Option<String> = None;
-
-            // Check auto correct wordlist
-            if let Some(r) = self.wordlists.get_replacement(word) {
-                info!("wordlist replace {}", r);
-
-                action = Some(CORRECTIVE_ACTION_REPLACE);
-                replacement = Some(r);
+            unsafe {
+                *value = std::ptr::null_mut();
             }
+            info!("Next");
 
-            // Check exclude wordlist
-            if action.is_none() && self.wordlists.contains_exclude(word) {
-                info!("wordlist incorrect");
-                action = Some(CORRECTIVE_ACTION_GET_SUGGESTIONS);
-                replacement = None;
-            }
+            loop {
+                let index = self.next_token.fetch_add(1, Ordering::SeqCst);
+                let token = match self.tokens.get(index) {
+                    Some(token) => token,
+                    None => return S_FALSE,
+                };
+                let word = token.text.as_str();
+                info!("Token {}: {:?}", token.start, word);
 
-            // Check add wordlist
-            if self.wordlists.contains_add(word) {
-                info!("wordlist added");
-                action = None;
-            } else {
-                // Query speller API
-                if action.is_none() && !self.speller_cache.to_owned().is_correct(word) {
+                // Check ignore wordlist
+                if self.wordlists.contains_ignore(word) {
+                    info!("Wordlist ignore");
+                    continue;
+                }
+
+                let mut action: Option<u32> = None;
+                let mut replacement: Option<String> = None;
+
+                // Check auto correct wordlist
+                if let Some(r) = self.wordlists.get_replacement(word) {
+                    info!("wordlist replace {}", r);
+
+                    action = Some(CORRECTIVE_ACTION_REPLACE);
+                    replacement = Some(r);
+                }
+
+                // Check exclude wordlist
+                if action.is_none() && self.wordlists.contains_exclude(word) {
+                    info!("wordlist incorrect");
                     action = Some(CORRECTIVE_ACTION_GET_SUGGESTIONS);
                     replacement = None;
                 }
+
+                // Check add wordlist
+                if self.wordlists.contains_add(word) {
+                    info!("wordlist added");
+                    action = None;
+                } else {
+                    // Query speller API
+                    if action.is_none() && !self.engine.is_correct(word) {
+                        action = Some(CORRECTIVE_ACTION_GET_SUGGESTIONS);
+                        replacement = None;
+                    }
+                }
+
+                let action = match action {
+                    Some(action) => action,
+                    None => continue,
+                };
+
+                info!(
+                    "word {:?}, error action: {:?}, replacement {:?}",
+                    word, action, replacement
+                );
+
+                self.engine.prime(word);
+
+                info!("start {}, length {}", token.start, token.length);
+
+                let error =
+                    DivvunSpellingError::new(token.start, token.length, action, replacement);
+
+                unsafe {
+                    *value = error as *mut _;
+                }
+                return S_OK;
             }
-
-            if action.is_none() {
-                continue;
-            }
-
-            info!(
-                "word {:?}, error action: {:?}, replacement {:?}",
-                word, action, replacement
-            );
-
-            self.speller_cache.prime(word);
-
-            info!("Rstart {}, Rlength {}", start, word.len());
-
-            let start = byte_off_to_idx(&self.text, tokenizer_start + start);
-            let length = byte_off_to_idx(&self.text, start + word.len())
-                - byte_off_to_idx(&self.text, start);
-
-            info!("start {}, length {}", start, length);
-
-            let error = DivvunSpellingError::new(
-                start as u32,
-                length as u32,
-                action.unwrap(),
-                replacement.to_owned(),
-            );
-
-            unsafe {
-                *value = error as *mut _;
-            }
-            return S_OK;
-        }
-
-        S_FALSE
+        })
     }
 }
 
 impl DivvunEnumSpellingError {
+    /// `text` is the checked text in UTF-16, as the caller passed it; error
+    /// positions are reported in the same units.
     pub fn new(
-        speller_cache: Arc<SpellerCache>,
+        engine: Arc<Engine>,
         wordlists: Arc<Wordlists>,
-        text: String,
+        text: &[u16],
     ) -> *mut DivvunEnumSpellingError {
         let s = Self {
             __vtable: Box::new(Self::create_vtable()),
             refs: AtomicU32::new(1),
-            speller_cache,
-            text: Arc::new(text),
-            text_offset: 0,
+            tokens: engine.tokens(text),
+            engine,
+            next_token: AtomicUsize::new(0),
             wordlists,
         };
 

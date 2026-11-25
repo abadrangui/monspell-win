@@ -1,8 +1,88 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
+use parking_lot::Mutex;
+
+use crate::guard;
+use crate::monspell_bridge;
 use crate::util;
+
+const BOX_MAGIC: [u8; 4] = [0xFF, b'B', b'O', b'X'];
+/// The only BOX container version the pinned box-format 0.3.2 can read.
+const BOX_VERSION: u32 = 0;
+const BOX_HEADER_BYTES: u64 = 24;
+
+lazy_static! {
+    static ref REFUSED_ARCHIVES: Mutex<HashSet<PathBuf>> = Mutex::new(HashSet::new());
+}
+
+/// Whether divvunspell can be trusted with this archive.
+///
+/// box-format 0.3.2 never checks the container version. Handed a version 1
+/// `.bhfst` (what current Divvun tooling writes) it reads the trailer with
+/// the version 0 layout, takes a garbage record count and asks the allocator
+/// for petabytes. A failed allocation is an abort, not an error or a panic,
+/// so it cannot be contained and it takes the spell-checking host down.
+/// Anything that is not a well-formed version 0 container is therefore
+/// refused before the parser sees it.
+pub fn is_readable_archive(path: &Path) -> bool {
+    if path.extension().map_or(true, |ext| ext != "bhfst") {
+        return true;
+    }
+    let problem = match read_box_header(path) {
+        Ok((version, trailer, file_len)) => {
+            if version != BOX_VERSION {
+                format!(
+                    "BOX container version {} (only {} is supported)",
+                    version, BOX_VERSION
+                )
+            } else if trailer < BOX_HEADER_BYTES || trailer >= file_len {
+                format!(
+                    "trailer offset {} outside the {}-byte file",
+                    trailer, file_len
+                )
+            } else {
+                return true;
+            }
+        }
+        Err(err) => err.to_string(),
+    };
+    if REFUSED_ARCHIVES.lock().insert(path.to_path_buf()) {
+        guard::report(&format!(
+            "ignoring speller archive {}: {}",
+            path.display(),
+            problem
+        ));
+    }
+    false
+}
+
+/// `(version, trailer offset, file length)` from a BOX container header:
+/// magic `FF 42 4F 58`, `u32` version, `u64` alignment, `u64` trailer offset,
+/// all little-endian.
+fn read_box_header(path: &Path) -> io::Result<(u32, u64, u64)> {
+    let mut file = fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut header = [0u8; BOX_HEADER_BYTES as usize];
+    file.read_exact(&mut header)?;
+    if header[0..4] != BOX_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a BOX container",
+        ));
+    }
+    let mut version = [0u8; 4];
+    version.copy_from_slice(&header[4..8]);
+    let mut trailer = [0u8; 8];
+    trailer.copy_from_slice(&header[16..24]);
+    Ok((
+        u32::from_le_bytes(version),
+        u64::from_le_bytes(trailer),
+        file_len,
+    ))
+}
 
 lazy_static! {
     pub static ref HARDCODED_TAG_TABLE: HashMap<String, Vec<String>> = {
@@ -61,7 +141,7 @@ fn find_speller_bundles(dir: &Path) -> Vec<PathBuf> {
                     visit_dirs(&path, results)?;
                 } else {
                     if let Some(ext) = path.extension() {
-                        if ext == "zhfst" || ext == "bhfst" {
+                        if (ext == "zhfst" || ext == "bhfst") && is_readable_archive(&path) {
                             results.push(path.to_owned());
                         }
                     }
@@ -105,9 +185,21 @@ impl SpellerRepository {
             })
             .flatten()
             .collect();
+        if monspell_bridge::is_installed() {
+            res.extend(resolve_local_name(monspell_bridge::LANGUAGE));
+        }
         res.sort();
         res.dedup();
         res
+    }
+
+    /// Whether `language_tag` is served by the monspell engine rather than
+    /// by a divvunspell archive.
+    pub fn is_monspell_language(&self, language_tag: &str) -> bool {
+        monspell_bridge::is_installed()
+            && resolve_local_name(monspell_bridge::LANGUAGE)
+                .iter()
+                .any(|tag| tag == language_tag)
     }
 
     pub fn get_speller_archive(&self, language_tag: &str) -> Option<PathBuf> {
@@ -156,5 +248,64 @@ fn sami_baseline_preserved() {
             neutral,
             neutral
         );
+    }
+}
+
+#[cfg(test)]
+fn temp_archive(name: &str, bytes: &[u8]) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("windivvun-{}-{}", std::process::id(), name));
+    fs::write(&path, bytes).expect("write temp archive");
+    path
+}
+
+#[cfg(test)]
+fn box_header(version: u32, trailer: u64) -> Vec<u8> {
+    let mut bytes = BOX_MAGIC.to_vec();
+    bytes.extend_from_slice(&version.to_le_bytes());
+    bytes.extend_from_slice(&8u64.to_le_bytes());
+    bytes.extend_from_slice(&trailer.to_le_bytes());
+    bytes
+}
+
+/// The archive that took down msspellcheckinghost.exe: a BOX version 1 file
+/// that box-format 0.3.2 parses into a 59-petabyte allocation request.
+#[test]
+fn box_v1_archive_is_refused() {
+    let stub = Path::new(env!("CARGO_MANIFEST_DIR")).join("Spellers/mn.bhfst");
+    assert_eq!(read_box_header(&stub).expect("stub header").0, 1);
+    assert!(!is_readable_archive(&stub));
+    assert!(find_speller_bundles(&stub.parent().expect("Spellers dir"))
+        .iter()
+        .all(|path| path != &stub));
+}
+
+#[test]
+fn box_header_validation() {
+    let mut good = box_header(0, 32);
+    good.resize(64, 0);
+    let good = temp_archive("good.bhfst", &good);
+    assert!(is_readable_archive(&good));
+
+    let mut v1 = box_header(1, 32);
+    v1.resize(64, 0);
+    let v1 = temp_archive("v1.bhfst", &v1);
+    assert!(!is_readable_archive(&v1));
+
+    // Trailer offset past the end of the file.
+    let dangling = temp_archive("dangling.bhfst", &box_header(0, 4096));
+    assert!(!is_readable_archive(&dangling));
+
+    let truncated = temp_archive("truncated.bhfst", &BOX_MAGIC);
+    assert!(!is_readable_archive(&truncated));
+
+    let garbage = temp_archive("garbage.bhfst", &[0u8; 64]);
+    assert!(!is_readable_archive(&garbage));
+
+    // Zip archives go through a different parser and are not judged here.
+    let zip = temp_archive("other.zhfst", &[0u8; 8]);
+    assert!(is_readable_archive(&zip));
+
+    for path in &[good, v1, dangling, truncated, garbage, zip] {
+        let _ = fs::remove_file(path);
     }
 }

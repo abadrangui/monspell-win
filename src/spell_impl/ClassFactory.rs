@@ -8,7 +8,7 @@ use winapi::ctypes::c_void;
 use winapi::shared::guiddef::{IsEqualGUID, GUID, REFIID};
 use winapi::shared::minwindef::{BOOL, TRUE};
 use winapi::shared::ntdef::ULONG;
-use winapi::shared::winerror::{E_NOINTERFACE, S_OK};
+use winapi::shared::winerror::{E_NOINTERFACE, E_POINTER, S_OK};
 use winapi::Interface;
 
 use crate::spellcheckprovider::ISpellCheckProviderFactory;
@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use com_impl::{implementation, interface, ComInterface};
 
+use crate::guard;
 use crate::util::fmt_guid;
 
 use super::SpellCheckProviderFactory::DivvunSpellCheckProviderFactory;
@@ -37,7 +38,15 @@ impl DivvunSpellCheckProviderFactoryClassFactory {
         riid: REFIID,
         ppvObject: *mut *mut c_void,
     ) -> HRESULT {
-        unsafe {
+        guard::hresult("IClassFactory::CreateInstance", || unsafe {
+            if ppvObject.is_null() {
+                return E_POINTER;
+            }
+            *ppvObject = std::ptr::null_mut();
+            if riid.is_null() {
+                return E_POINTER;
+            }
+
             info!("CreateInstance for {}", fmt_guid(&*riid));
             if IsEqualGUID(&*riid, &ISpellCheckProviderFactory::uuidof()) {
                 info!("Creating SpellCheckProviderFactory");
@@ -45,19 +54,21 @@ impl DivvunSpellCheckProviderFactoryClassFactory {
                 *ppvObject = ptr as *mut _;
                 return S_OK;
             }
-        }
-        E_NOINTERFACE
+            E_NOINTERFACE
+        })
     }
 
     fn LockServer(&mut self, fLock: BOOL) -> HRESULT {
-        info!("LockServer");
-        if fLock == TRUE {
-            self.AddRef();
-        } else {
-            self.Release();
-        }
+        guard::hresult("IClassFactory::LockServer", || {
+            info!("LockServer");
+            if fLock == TRUE {
+                self.AddRef();
+            } else {
+                self.Release();
+            }
 
-        S_OK
+            S_OK
+        })
     }
 }
 

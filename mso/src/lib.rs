@@ -29,6 +29,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 mod engine;
+pub mod wsc;
 
 use core::ffi::c_void;
 use core::ptr;

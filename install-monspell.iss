@@ -3,24 +3,31 @@
 ; Forked from the upstream `install.iss` (WinDivvun) but kept as a parallel
 ; file so upstream rebases do not conflict. See docs/fork-divergence.md.
 ;
-; Phase 0 scope:
-;  - windivvun.dll (WSCAPI provider) — both 32-bit and 64-bit. WSCAPI provider
-;    DLLs must match the bitness of the app loading them (64-bit Word needs
-;    64-bit DLL; 32-bit Office or UWP apps need 32-bit). Registered in both
-;    HKLM32 + HKLM64 registry views so Windows finds the right one per caller.
-;  - monspell_mso.dll (CSAPI "say-yes" stub) — both bitnesses. Required
-;    because Word 2016+ will not dispatch WSCAPI for a language unless a
-;    CSAPI proofing tool is also registered for it. Microsoft never shipped
-;    a CSAPI proofing tool for Mongolian, so we ship our own minimum-viable
-;    stub. Registered at both the legacy Override\<lang>\LEX/DLL path and
-;    the Spelling\<LCID>\Normal\Engine/Dictionary path.
-;  - Stub mn.bhfst (WSCAPI dictionary) and empty mn.lex (CSAPI dictionary
-;    placeholder). The real Mongolian FST arrives in Phase 1 from lang-khk.
+; Scope:
+;  - windivvun.dll (WSCAPI provider) — both 32-bit and 64-bit. Windows loads
+;    it into msspellcheckinghost.exe (64-bit on x64 Windows), which serves
+;    every WSCAPI app. Registered in both HKLM32 + HKLM64 registry views.
+;    For Mongolian it does not check words itself: it loads the engine from
+;    monspell_mso.dll in the same folder.
+;  - monspell_mso.dll — both bitnesses. Two jobs: the CSAPI proofing tool
+;    Word needs (Word 2016+ uses CSAPI only for a language that has one, and
+;    Microsoft never shipped one for Mongolian), and the engine bridge the
+;    WSCAPI provider calls. Registered at both the legacy
+;    Override\<lang>\LEX/DLL path and the
+;    Spelling\<LCID>\Normal\Engine/Dictionary path.
+;  - Engine data in {app}\Spellers: dict-mn (mn_MN.aff + mn_MN.dic, with its
+;    README and license) and freq.tsv. Shipped as files, never compiled in.
+;    Plus an empty mn.lex (CSAPI dictionary placeholder).
+;  - No .bhfst: the Phase 0 stub mn.bhfst crashed the spell-checking host
+;    (see docs/fork-divergence.md, 2026-11-25) and is removed on upgrade.
 ;  - No spelli.exe — this script does all the registry writes inline.
 ;  - Unsigned per ADR-0003.
+;
+; Before compiling, build the four DLLs and stage the data files; the steps
+; are in docs/fork-divergence.md (2026-11-25 entry).
 
 #define MyAppName "monspell"
-#define MyAppVersion "0.1.0-beta"
+#define MyAppVersion "0.1.2-beta"
 #define MyAppPublisher "abadrangui"
 #define MyAppURL "https://github.com/abadrangui/monspell"
 
@@ -54,26 +61,35 @@ ArchitecturesAllowed=x86 x64compatible
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
-; 32-bit windivvun DLL (WSCAPI) — loaded by 32-bit apps (legacy Office, some UWP hosts).
+; 32-bit windivvun DLL (WSCAPI) — the spell-checking host on 32-bit Windows.
+; Built by the pinned i686-host nightly, hence the bare target\release path.
 Source: "target\release\windivvun.dll"; DestDir: "{app}\i686\"; Flags: ignoreversion restartreplace uninsrestartdelete
-; 64-bit windivvun DLL (WSCAPI) — loaded by 64-bit Word / Outlook / most Office 365 installs.
+; 64-bit windivvun DLL (WSCAPI) — the spell-checking host on x64 Windows.
 Source: "target\x86_64-pc-windows-msvc\release\windivvun.dll"; DestDir: "{app}\x86_64\"; Flags: ignoreversion restartreplace uninsrestartdelete; Check: IsWin64
-; 32-bit monspell_mso DLL (CSAPI "say-yes" stub) — unlocks Word's language gate for 32-bit Office.
-Source: "mso\target\release\monspell_mso.dll"; DestDir: "{app}\i686\"; Flags: ignoreversion restartreplace uninsrestartdelete
-; 64-bit monspell_mso DLL (CSAPI "say-yes" stub) — unlocks Word's language gate for 64-bit Office 365.
+; 32-bit monspell_mso DLL — CSAPI tool for 32-bit Office + engine for the 32-bit provider.
+Source: "mso\target\i686-pc-windows-msvc\release\monspell_mso.dll"; DestDir: "{app}\i686\"; Flags: ignoreversion restartreplace uninsrestartdelete
+; 64-bit monspell_mso DLL — CSAPI tool for 64-bit Office 365 + engine for the 64-bit provider.
 Source: "mso\target\x86_64-pc-windows-msvc\release\monspell_mso.dll"; DestDir: "{app}\x86_64\"; Flags: ignoreversion restartreplace uninsrestartdelete; Check: IsWin64
-; WSCAPI speller data — stub, flags every word.
-Source: "Spellers\mn.bhfst"; DestDir: "{app}\Spellers\"; Flags: ignoreversion
-; Engine data for monspell_mso.dll (real CSAPI spell-check via monspell-core).
-; Stage before building: mn_MN.aff/mn_MN.dic from abadrangui/dict-mn (LPPL-1.3c,
-; redistribution permitted), freq.tsv = corpus/derived/lawcorpus-freq.tsv from
-; the monspell repo.
+; Engine data, read at runtime by monspell_mso.dll for both the CSAPI and the
+; WSCAPI path. Stage before building: everything in mn_MN\ plus LICENSE from
+; abadrangui/dict-mn (LPPL-1.3c), and freq.tsv = corpus/derived/lawcorpus-freq.tsv
+; from the monspell repo. LPPL clause 2 makes README_mn_MN.txt and the license
+; text part of a complete copy: they ship with the .aff/.dic, always.
 Source: "Spellers\mn_MN.aff"; DestDir: "{app}\Spellers\"; Flags: ignoreversion
 Source: "Spellers\mn_MN.dic"; DestDir: "{app}\Spellers\"; Flags: ignoreversion
+Source: "Spellers\README_mn_MN.txt"; DestDir: "{app}\Spellers\"; Flags: ignoreversion
+Source: "Spellers\LICENSE-dict-mn.txt"; DestDir: "{app}\Spellers\"; Flags: ignoreversion
 Source: "Spellers\freq.tsv"; DestDir: "{app}\Spellers\"; Flags: ignoreversion skipifsourcedoesntexist
 ; CSAPI lexicon placeholder — empty; our CSAPI stub never reads it, but Word
 ; wants the registered LEX path to exist on disk before it will load the DLL.
 Source: "Spellers\mn.lex"; DestDir: "{app}\Spellers\"; Flags: ignoreversion
+
+[InstallDelete]
+; 0.1.0-beta shipped a stub mn.bhfst in a container format the WSCAPI
+; provider's parser cannot read; loading it killed msspellcheckinghost.exe.
+; The provider now refuses it, but the engine would still load it as a
+; useless FST suggestion source, so take it out on upgrade.
+Type: files; Name: "{app}\Spellers\mn.bhfst"
 
 [Dirs]
 Name: "{app}\Spellers"
@@ -101,12 +117,11 @@ Root: HKLM32; Subkey: "SOFTWARE\Classes\CLSID\{#Clsid}\Version"; ValueType: stri
 Root: HKLM32; Subkey: "SOFTWARE\Classes\CLSID\{#Clsid}\InProcServer32"; ValueType: string; ValueName: ""; ValueData: "{app}\i686\windivvun.dll"; Flags: uninsdeletekey
 Root: HKLM32; Subkey: "SOFTWARE\Classes\CLSID\{#Clsid}\InProcServer32"; ValueType: string; ValueName: "ThreadingModel"; ValueData: "Both"; Flags: uninsdeletekey
 
-; Our DLL scans two hard-coded locations for .bhfst files (see
-; windivvun-service/src/lib.rs::SPELLER_REPOSITORY). The second one is
-; derived from the DLL's own install path: <install_root>\Spellers\.
-; The [Dirs] section above already created that folder; [Files] above
-; puts mn.bhfst in it. So no extra per-language registry entries are
-; required for WSCAPI discovery.
+; The provider needs no per-language registry entries. It offers Mongolian
+; when monspell_mso.dll sits next to it and <install_root>\Spellers\ holds
+; mn_MN.aff + mn_MN.dic (src/monspell_bridge.rs); [Files] above puts both
+; there. Other languages still come from .bhfst/.zhfst files in the two
+; directories src/lib.rs::SPELLER_REPOSITORY scans.
 
 ; ====================================================================
 ; Office CSAPI (Custom Proofing Tool) registration.
@@ -181,11 +196,14 @@ function GetMonspellCount(Param: String): String;
 begin
   // `Count` is the signal to Office that User Settings\<app>\Create has
   // un-applied entries. We only need a non-zero DWORD that differs between
-  // fresh installs. yyMMddHHmm packs into 10 digits → max ~9912312359, which
-  // fits in u32 (max 4294967295) from year 2043 backwards; fine for our
-  // lifetime. GetDateTimeString is Inno's Pascal-runtime-safe way to read
+  // fresh installs. The caller runs StrToInt, which is a SIGNED 32-bit
+  // Integer (max 2147483647): the full 'yymmddhhnn' (2611251153 in Nov
+  // 2026) overflows and Count was written as -1 on every install, so Office
+  // copied the Create tree only once. Keep the last 9 digits (ymmddhhnn,
+  // max 912312359): always fits, changes every minute, repeats every 10
+  // years. GetDateTimeString is Inno's Pascal-runtime-safe way to read
   // system time without TSystemTime bindings.
-  Result := GetDateTimeString('yymmddhhnn', #0, #0);
+  Result := Copy(GetDateTimeString('yymmddhhnn', #0, #0), 2, 9);
 end;
 
 procedure WriteProofingOverride(RootKey: Integer; BasePath: String; InstallPath: String);

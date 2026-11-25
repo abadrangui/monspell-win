@@ -2,6 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::io;
 use std::mem;
 use std::os::windows::prelude::*;
+use std::path::PathBuf;
 use winapi::ctypes::c_int;
 use winapi::shared::guiddef::GUID;
 use winapi::shared::wtypesbase::OLECHAR;
@@ -26,23 +27,32 @@ pub fn to_u16s<S: AsRef<OsStr>>(s: S) -> io::Result<Vec<u16>> {
     inner(s.as_ref())
 }
 
-pub unsafe fn u16_ptr_to_string(ptr: *const u16) -> OsString {
+/// The NUL-terminated UTF-16 string at `ptr`, without its terminator.
+pub unsafe fn u16_ptr_to_slice<'a>(ptr: *const u16) -> &'a [u16] {
     let len = winbase::lstrlenW(ptr) as usize;
-    let slice = std::slice::from_raw_parts(ptr, len);
+    std::slice::from_raw_parts(ptr, len)
+}
 
-    OsString::from_wide(slice)
+pub unsafe fn u16_ptr_to_string(ptr: *const u16) -> OsString {
+    OsString::from_wide(u16_ptr_to_slice(ptr))
 }
 
 pub fn wide_from_slice(slice: &[u16]) -> OsString {
-    let len = (0..).take_while(|&i| slice[i] != 0).count();
+    let len = slice.iter().position(|&u| u == 0).unwrap_or(slice.len());
     OsString::from_wide(&slice[0..len])
 }
 
+/// Copy `s` into a NUL-terminated COM string. `None` when the string holds an
+/// interior NUL or the allocation fails; the caller owns the result and frees
+/// it with `CoTaskMemFree`.
 pub unsafe fn alloc_com_str<S: AsRef<OsStr>>(s: S) -> Option<*mut OLECHAR> {
     unsafe fn inner(s: &OsStr) -> Option<*mut OLECHAR> {
-        let s_vec = to_u16s(s).unwrap();
+        let s_vec = to_u16s(s).ok()?;
         let str_size = s_vec.len() * mem::size_of::<OLECHAR>();
         let elem_str = CoTaskMemAlloc(str_size) as *mut OLECHAR;
+        if elem_str.is_null() {
+            return None;
+        }
 
         info!("Str {:?} size {}, ptr {:?}", s, str_size, elem_str);
         // Copy string
@@ -81,6 +91,12 @@ pub fn get_module_path() -> Option<OsString> {
 
     let osstr = wide_from_slice(&path);
     Some(osstr)
+}
+
+/// The directory this DLL was loaded from (`<install root>\<arch>`).
+pub fn module_dir() -> Option<PathBuf> {
+    let path = PathBuf::from(get_module_path()?);
+    path.parent().map(|dir| dir.to_path_buf())
 }
 
 pub fn fmt_guid(guid: &GUID) -> String {

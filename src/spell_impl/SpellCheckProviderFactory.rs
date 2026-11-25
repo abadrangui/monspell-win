@@ -20,6 +20,7 @@ use com_impl::{implementation, interface, ComInterface};
 use super::EnumString::EnumString;
 use super::SpellCheckProvider::DivvunSpellCheckProvider;
 
+use crate::guard;
 use crate::SPELLER_REPOSITORY;
 
 #[interface(ISpellCheckProviderFactory)]
@@ -32,28 +33,38 @@ IMPL_UNKNOWN!(ISpellCheckProviderFactory, DivvunSpellCheckProviderFactory);
 #[implementation(ISpellCheckProviderFactory)]
 impl DivvunSpellCheckProviderFactory {
     fn get_SupportedLanguages(&mut self, value: *mut *mut IEnumString) -> HRESULT {
-        info!("get supported languages");
-        let langs = SPELLER_REPOSITORY.get_supported_languages();
-        let enum_if = EnumString::new(langs);
-        unsafe {
-            *value = enum_if as *mut _;
-        }
-        S_OK
+        guard::hresult("ISpellCheckProviderFactory::get_SupportedLanguages", || {
+            if value.is_null() {
+                return E_POINTER;
+            }
+            info!("get supported languages");
+            let langs = SPELLER_REPOSITORY.get_supported_languages();
+            let enum_if = EnumString::new(langs);
+            unsafe {
+                *value = enum_if as *mut _;
+            }
+            S_OK
+        })
     }
 
     fn IsSupported(&mut self, LanguageTag: LPCWSTR, value: *mut i32) -> HRESULT {
-        let tag = com_wstr_ptr!(LanguageTag);
+        guard::hresult("ISpellCheckProviderFactory::IsSupported", || {
+            if value.is_null() {
+                return E_POINTER;
+            }
+            let tag = com_wstr_ptr!(LanguageTag);
 
-        let langs = SPELLER_REPOSITORY.get_supported_languages();
-        let supported = langs.contains(&tag);
+            let langs = SPELLER_REPOSITORY.get_supported_languages();
+            let supported = langs.contains(&tag);
 
-        info!("is supported {:?}: {}", tag, supported);
+            info!("is supported {:?}: {}", tag, supported);
 
-        unsafe {
-            *value = supported as i32;
-        }
+            unsafe {
+                *value = supported as i32;
+            }
 
-        S_OK
+            S_OK
+        })
     }
 
     fn CreateSpellCheckProvider(
@@ -61,26 +72,40 @@ impl DivvunSpellCheckProviderFactory {
         LanguageTag: LPCWSTR,
         value: *mut *mut ISpellCheckProvider,
     ) -> HRESULT {
-        let tag = com_wstr_ptr!(LanguageTag);
-        let langs = SPELLER_REPOSITORY.get_supported_languages();
-        let supported = langs.contains(&tag);
+        guard::hresult(
+            "ISpellCheckProviderFactory::CreateSpellCheckProvider",
+            || {
+                if value.is_null() {
+                    return E_POINTER;
+                }
+                unsafe {
+                    *value = std::ptr::null_mut();
+                }
+                let tag = com_wstr_ptr!(LanguageTag);
+                let langs = SPELLER_REPOSITORY.get_supported_languages();
+                let supported = langs.contains(&tag);
 
-        if !supported {
-            return E_INVALIDARG;
-        }
+                if !supported {
+                    return E_INVALIDARG;
+                }
 
-        info!("create spell check provider {:?}", tag);
+                info!("create spell check provider {:?}", tag);
 
-        if let Some(provider) = DivvunSpellCheckProvider::new(&tag) {
-            unsafe {
-                *value = provider as *mut _;
-            }
-            S_OK
-        } else {
-            info!("spell check provider creation failed");
-            // Spell check provider creation failed for some reason we can't communicate anyway
-            E_INVALIDARG
-        }
+                if let Some(provider) = DivvunSpellCheckProvider::new(&tag) {
+                    unsafe {
+                        *value = provider as *mut _;
+                    }
+                    S_OK
+                } else {
+                    guard::report(&format!(
+                        "spell check provider creation failed for {:?}",
+                        tag
+                    ));
+                    // Spell check provider creation failed for some reason we can't communicate anyway
+                    E_INVALIDARG
+                }
+            },
+        )
     }
 }
 

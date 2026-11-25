@@ -3,6 +3,10 @@
 //! Engine data: MONSPELL_ENGINE_DIR, or ../../dict-mn/mn_MN relative to this
 //! crate (the layout used by monspell's CI and the dev machines).
 
+use monspell_mso::wsc::{
+    MonspellWscAbiVersion, MonspellWscIsCorrect, MonspellWscLoad, MonspellWscLoadError,
+    MonspellWscNextToken, MonspellWscSuggest, WSC_ABI_VERSION,
+};
 use monspell_mso::{SPELLERSUGGESTION, SpellerCheck, WSIB, WSRB};
 
 fn utf16(s: &str) -> Vec<u16> {
@@ -12,6 +16,12 @@ fn utf16(s: &str) -> Vec<u16> {
 /// Stage a temp engine dir mirroring the installer layout: dict-mn files
 /// plus a freq.tsv (suggestion ranking is part of the shipped behaviour).
 fn ensure_engine_dir() {
+    // Tests run on parallel threads; stage once.
+    static STAGE: std::sync::Once = std::sync::Once::new();
+    STAGE.call_once(stage_engine_dir);
+}
+
+fn stage_engine_dir() {
     if std::env::var("MONSPELL_ENGINE_DIR").is_ok() {
         return;
     }
@@ -100,6 +110,11 @@ fn csapi_contract() {
     let out = check_buffer(&digits, 0, digits.len());
     assert_eq!(out.sstat, 0, "digit-adjacent fragment must be skipped");
 
+    // 4b. So is a suffix hanging off a Latin word: "Excel-д" must not flag "д".
+    let latin = utf16("Excel-д PDF-ийг хуулийн");
+    let out = check_buffer(&latin, 0, latin.len());
+    assert_eq!(out.sstat, 0, "suffix on a Latin word must be skipped");
+
     // 5. Suggest: caller-allocated arena + suggestion array get filled.
     let word = utf16("хуулын");
     let mut lex: [*mut core::ffi::c_void; 0] = [];
@@ -165,4 +180,125 @@ fn csapi_contract() {
     assert_eq!(wsrb_small.csz, 0, "nothing fits in 4 units (хуулийн needs 8)");
     assert_eq!(wsrb_small.cchMac, 0);
     assert!(small.iter().all(|&u| u == 0xABAB), "arena must be untouched");
+}
+
+/// The exports windivvun.dll (WSCAPI provider) calls, driven the way it
+/// drives them: caller-owned UTF-16 buffers in, plain integers out.
+#[test]
+fn wsc_bridge_contract() {
+    ensure_engine_dir();
+    assert_eq!(MonspellWscAbiVersion(), WSC_ABI_VERSION);
+    assert_eq!(MonspellWscLoad(), 1, "engine must load from the staged dir");
+    let mut reason = [0u16; 64];
+    let written = unsafe { MonspellWscLoadError(reason.as_mut_ptr(), reason.len()) };
+    assert_eq!(written, 0, "a loaded engine has no load error to report");
+
+    // 1. Tokens come back as UTF-16 spans, in order, resumable. Suffix
+    //    fragments on digits and on Latin words are skipped exactly as on
+    //    the CSAPI path; Cyrillic glued straight onto a Latin letter (Latin
+    //    `c` typed for `с`) is still a token, so the typo gets checked.
+    let text = utf16("5-ны өдөр Excel-д cайн хуулын төсөл.");
+    let mut words = Vec::new();
+    let mut from = 0usize;
+    loop {
+        let (mut start, mut len, mut next) = (0usize, 0usize, 0usize);
+        let rc = unsafe {
+            MonspellWscNextToken(
+                text.as_ptr(),
+                text.len(),
+                from,
+                &mut start,
+                &mut len,
+                &mut next,
+            )
+        };
+        match rc {
+            1 => {
+                assert!(next >= start + len && next <= text.len());
+                words.push(String::from_utf16_lossy(&text[start..start + len]));
+                from = next;
+            }
+            0 => break,
+            other => panic!("unexpected NextToken result {other}"),
+        }
+    }
+    assert_eq!(words, ["өдөр", "айн", "хуулын", "төсөл"]);
+
+    // 2. Recognition.
+    let good = utf16("хуулийн");
+    let bad = utf16("хуулын");
+    assert_eq!(
+        unsafe { MonspellWscIsCorrect(good.as_ptr(), good.len()) },
+        1
+    );
+    assert_eq!(unsafe { MonspellWscIsCorrect(bad.as_ptr(), bad.len()) }, 0);
+
+    // 3. Suggestions land in the caller's buffer, NUL-separated, best first.
+    let mut buf = [0u16; 256];
+    let mut used = 0usize;
+    let count = unsafe {
+        MonspellWscSuggest(
+            bad.as_ptr(),
+            bad.len(),
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut used,
+        )
+    };
+    assert!(count >= 1, "must return at least one suggestion");
+    assert!(used <= buf.len());
+    let listed: Vec<String> = buf[..used]
+        .split(|&u| u == 0)
+        .filter(|s| !s.is_empty())
+        .map(String::from_utf16_lossy)
+        .collect();
+    assert_eq!(listed.len(), count as usize);
+    assert_eq!(listed[0], "хуулийн");
+
+    // 4. Too-small buffer: nothing fits, nothing is written.
+    let mut small = [0xABABu16; 4];
+    let mut used_small = usize::MAX;
+    let count = unsafe {
+        MonspellWscSuggest(
+            bad.as_ptr(),
+            bad.len(),
+            small.as_mut_ptr(),
+            small.len(),
+            &mut used_small,
+        )
+    };
+    assert_eq!((count, used_small), (0, 0));
+    assert!(
+        small.iter().all(|&u| u == 0xABAB),
+        "buffer must be untouched"
+    );
+
+    // 5. Null pointers are an error code, never a crash.
+    let mut used_null = 0usize;
+    assert_eq!(unsafe { MonspellWscIsCorrect(core::ptr::null(), 3) }, -1);
+    assert_eq!(
+        unsafe {
+            MonspellWscSuggest(
+                core::ptr::null(),
+                0,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut used_null,
+            )
+        },
+        -1
+    );
+    assert_eq!(
+        unsafe {
+            MonspellWscNextToken(
+                core::ptr::null(),
+                0,
+                0,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            )
+        },
+        -1
+    );
 }

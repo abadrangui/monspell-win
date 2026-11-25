@@ -21,16 +21,19 @@ macro_rules! IMPL_UNKNOWN {
             fn AddRef(&mut self) -> ULONG {
                 let prev = self.refs.fetch_add(1, Ordering::SeqCst);
                 // info!("AddRef: {}", prev);
-                prev + 1
+                prev.wrapping_add(1)
             }
 
             fn Release(&mut self) -> ULONG {
                 let prev = self.refs.fetch_sub(1, Ordering::SeqCst);
                 // info!("Release: {}", prev);
                 if prev == 1 {
-                    let _box = unsafe { Box::from_raw(self as *mut _) };
+                    let this = self as *mut Self;
+                    crate::guard::contain("IUnknown::Release", (), || {
+                        let _box = unsafe { Box::from_raw(this) };
+                    });
                 }
-                prev - 1
+                prev.wrapping_sub(1)
             }
         }
     };
